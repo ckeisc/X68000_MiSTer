@@ -135,7 +135,10 @@ parameter CONF_STR = {
 	"MT32-pi: MT-32 v1,",
 	"MT32-pi: MT-32 v2,",
 	"MT32-pi: CM-32L,",
-	"MT32-pi: Unknown mode;",
+	"MT32-pi: Unknown mode,", // PROTOTYPE: was list terminator; moved to MU50 below
+	"MT32-pi: EmuSC,", // PROTOTYPE: info code 13 (mt32_mode 0xA3)
+	"MT32-pi: Nuked SC-55,", // PROTOTYPE: info code 14 (mt32_mode 0xA4)
+	"MT32-pi: MU50;", // PROTOTYPE: info code 15 (mt32_mode 0xA5); ";" terminates the I, list
 	"V,v",`BUILD_DATE
 };
 
@@ -630,7 +633,10 @@ always @(posedge clk_sys) begin
 	mt32_info_disp <= (mt32_mode == 'hA2) ? (4'd1 + mt32_sf[2:0]) :
                      (mt32_mode == 'hA1 && mt32_rom == 0) ?  4'd9 :
                      (mt32_mode == 'hA1 && mt32_rom == 1) ?  4'd10 :
-                     (mt32_mode == 'hA1 && mt32_rom == 2) ?  4'd11 : 4'd12;
+                     (mt32_mode == 'hA1 && mt32_rom == 2) ?  4'd11 :
+                     (mt32_mode == 'hA3) ? 4'd13 : // PROTOTYPE: EmuSC
+                     (mt32_mode == 'hA4) ? 4'd14 : // PROTOTYPE: Nuked SC-55
+                     (mt32_mode == 'hA5) ? 4'd15 : 4'd12; // PROTOTYPE: MU50, else Unknown
 end
 
 reg mt32_lcd_update_meta = 0;

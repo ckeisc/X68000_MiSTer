@@ -1,0 +1,66 @@
+name: Build X68000 RBF (baseline, unmodified master)
+
+# Compiles the X68000 MiSTer FPGA core (X68000.qpf) into an RBF using
+# Quartus Prime Lite 17.0.2 in the prebuilt raetro/quartus:17.0 Docker
+# image — no local Quartus install needed. Modelled on
+# srg320/Saturn_MiSTer and gmcnaught/maldita.castilla-mister.
+#
+# Notes:
+# - The build runs in Docker via a host-side `docker run` (not a
+#   job-level container), so the free-disk-space step below runs on the
+#   runner host, before the ~5.6 GB image is pulled. GitHub-hosted
+#   runners have only 14 GB SSD and the image needs ~18 GB unpacked.
+# - Quartus 17.0.2 is the version MiSTer standardises on (X68000.qsf
+#   pins LAST_QUARTUS_VERSION "17.0.2 Lite Edition"); newer Quartus
+#   versions infer memory differently and are not equivalent.
+# - Baseline build: unmodified upstream master RTL (no LCD prototype).
+#   Workflow file only; used to compare fit/timing against the prototype.
+
+on:
+  push:
+    branches:
+      - baseline/unmodified-master
+  workflow_dispatch:
+
+jobs:
+  build-rbf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space (Quartus image needs ~18 GB)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Compile RBF (Quartus Lite 17.0.2 in Docker)
+        run: |
+          docker run --rm -v "$PWD:/build" raetro/quartus:17.0 \
+            bash -c "cd /build && quartus_sh --flow compile X68000.qpf"
+
+      - name: Show result
+        run: ls -lh output_files/X68000.rbf output_files/X68000.fit.summary
+
+      - name: Upload Quartus reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quartus-reports
+          path: |
+            output_files/*.rpt
+            output_files/*.summary
+          if-no-files-found: warn
+
+      - name: Upload RBF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: x68000-rbf
+          path: output_files/X68000.rbf
+          if-no-files-found: error

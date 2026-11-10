@@ -1,10 +1,12 @@
 # PROTOTYPE — mt32-pi text LCD (option C), X68000 only
 
-Branch: `prototype/mt32pi-lcd-text-x68000` (local only, not pushed).
-Status: **prototype, NOT verified.** No Quartus, verilator, iverilog or yosys
-exists on this VM, so the RTL has never been compiled or simulated.
-Do not ship as-is. The old bitmap path is untouched and still the default
-until a text packet arrives.
+Branch: `prototype/mt32pi-lcd-text-x68000` (on fork
+`ckeisc/X68000_MiSTer`, built in CI via GitHub Actions +
+`raetro/quartus:17.0`; nothing pushed to upstream MiSTer-devel).
+Status: **prototype, NOT hardware-tested.** FIX1 closed video timing
+in CI; FIX2 (CGRAM) is built the same way and awaits its CI run.
+Do not ship as-is. The old bitmap path is untouched and still the
+default until a text packet arrives.
 
 ## FIX1 (2026-11-09) — pipelined text expansion, timing fix
 
@@ -30,13 +32,17 @@ registers, no division/modulo/multiplier in the video path:
   past entry 79).
 
 CGRAM and flags are now wired in (they were write-only before):
-- Codes < 0x10 render from CGRAM (8 chars x 8 rows, 5 bits/row) instead
-  of as solid blocks — MU50 bar-graph / SC-55 level-meter glyphs.
 - `flags` bit 0 gates the text pixels (LCD enable).
 - `flags` bits 4:0 render as 5 MU50 LED squares (5 px wide + 1 px gap,
   page 4, y 32..37, x 0..29; bit i = LED i), shown whenever a text
   packet is active in MU50 mode, independent of the LCD-enable flag.
   Only visible in 128x64 mode (page 4 is outside the 128x32 window).
+- CGRAM: FIX1 *attempted* to render codes < 0x10 from CGRAM, but the
+  read went through `txt_glyph_row()` and Quartus 17.0's elaborator
+  did not trace it — warning 10036 persisted and the 64x8 CGRAM was
+  optimised away in synthesis (FIX1 netlist: mt32pi memory bits
+  8,832 = `lcd_data` 8,192 + DDRAM 640 only). Codes < 0x10 therefore
+  still rendered as solid blocks in the FIX1 build. See FIX2 below.
 
 Rendered output is otherwise unchanged (6 px/char, 8 px/row, same
 addressing). Verified by a Python cycle-model of the pipeline against
@@ -45,6 +51,41 @@ the original combinational logic (`/tmp/fix1_model.py`, kept on the VM):
 horizontal-blanking sweep, and LED geometry matches spec. Timing is
 still to be confirmed by the CI rebuild (this fix + rebuild is the one
 authorised iteration).
+
+## FIX2 (2026-11-10) — CGRAM custom chars survive synthesis
+
+FIX2 removes the CGRAM read from `txt_glyph_row()` (function deleted;
+the font-ROM path stays in `lcd_text_font_row()`) and reads
+`lcd_text_cgram` directly in the clocked video block into a register
+— the same synchronous-read shape that saved DDRAM in FIX1. A sync
+CGRAM read needs one more pipeline stage (the CGRAM address
+`{char[2:0], row}` only exists once the DDRAM byte is registered),
+so the fetch now starts at `px0` instead of `px3`:
+
+- `px0`: DDRAM address of the next char; `px1`: DDRAM byte;
+  `px2`: CGRAM address + custom flag; `px3`: CGRAM byte (direct
+  sync read); `px4`: glyph row (CGRAM byte, or font ROM); `px5`: wrap.
+- The blanking prefetch of char 0 re-asserts the DDRAM address
+  every cycle and runs the remaining four stages on a separate
+  counter (`txt_blank_stage` 0..3), so it converges (worst case
+  ~8 cycles; real blanking is >100 CE_PIXEL cycles) no matter what
+  phase the counter is in when blanking starts. A first version
+  that staged all five blanking steps on one counter failed the
+  cycle-model at some blanking lengths: after a window the shared
+  registers hold the last in-window fetch (addr = idx(19)), so a
+  pass starting mid-sequence computed char 0's glyph from char 19.
+
+Verified by a Python cycle-model of the FIX2 pipeline against a
+direct reference render (`/tmp/fix2_model.py`): 0 pixel mismatches
+across MU50/SC-55 x flags on/off at blanking lengths 40/12/8, with
+random DDRAM (custom chars, ASCII, blanks, odd codes) and random
+CGRAM; the blanking threshold is 8 cycles (shorter blanking leaves
+char 0 wrong — not a concern at real blanking lengths). No
+`(* preserve *)` / `ramstyle` attributes, no dummy read, no direct
+`altsyncram` instantiation — the registered direct read is the fix.
+CI verification pending: mt32pi memory bits must read 9,344
+(8,832 + 512 CGRAM), a `lcd_text_cgram` sync RAM must appear in the
+netlist, warning 10036 must be gone, and setup slack must stay ≥ 0.
 
 ## What it does
 
@@ -60,8 +101,8 @@ byte  0: control 0x00            (0x40 = existing SSD1306 bitmap path)
 byte  1: magic 0x54 ('T')
 byte  2: mode: 0 = SC-55, 1 = MU50
 bytes 3..82:   DDRAM, 80 bytes (HD44780 addressing)
-bytes 83..146: CGRAM, 64 bytes (captured, not rendered yet)
-byte  147: flags: bit0 LCD enable, bits 4:0 MU50 LEDs (captured, not rendered)
+bytes 83..146: CGRAM, 64 bytes (rendered from FIX2; FIX1 captured only)
+byte  147: flags: bit0 LCD enable, bits 4:0 MU50 LEDs (rendered, FIX1)
 total: 148 bytes after the I2C address. Send on change only, from Core 1.
 ```
 
@@ -80,8 +121,8 @@ behaviour. A malformed text packet (wrong magic) is ignored.
   3325-bit ROM was verified round-trip against the source table).
   Covers ASCII 0x20..0x7E only; other codes render blank.
 - CGRAM characters (codes < 0x10, i.e. MU50's bar-graph glyphs and the
-  SC-55 level-meter glyphs) render from CGRAM (FIX1); before FIX1 they
-  rendered as solid blocks.
+  SC-55 level-meter glyphs) render from CGRAM (FIX2; FIX1 captured
+  them but they did not survive synthesis — see FIX2 above).
 - MU50 LEDs render as 5 squares in the row below the text (FIX1).
 
 ## Files changed
@@ -99,8 +140,10 @@ behaviour. A malformed text packet (wrong magic) is ignored.
   SC-55 DDRAM snapshot from Nuked (`LCD_Data[80]` + `LCD_CG[64]`) and the
   MU50 HD44780 port, then a Core-1 sender over I2C 0x3C. Until then the
   prototype can only be exercised with a test I2C master.
-- **CGRAM / LEDs / contrast**: captured, not rendered. MU50 bar-graph
-  characters will show as solid blocks until CGRAM expansion lands.
+- **Contrast**: not modelled — the text packet carries no contrast byte
+  (the bitmap path never had one either).
+- **CGRAM in the FIX1 build**: captured but not rendered in synthesis
+  (see FIX2); fixed by FIX2, CI verification pending.
 - **Font**: Nuked's font is used for both modes. MU50's real glyphs come
   from `mu100-font.bin`; ASCII is near-identical, custom glyphs differ.
 - **Main**: the `Show Info` popup names are fixed here, but Main's
@@ -117,8 +160,10 @@ behaviour. A malformed text packet (wrong magic) is ignored.
 1. A spurious STOP with `textdata` still set re-toggles `mt32_lcd_update`
    (extra LCD-Auto wake). Harmless, but `textdata` should be cleared on STOP.
 2. ~~`/ 6` and `% 6` in the render path~~ — FIXED by FIX1 (pixel counter).
-3. ~~`lcd_text_cgram` / `lcd_text_flags` write-only~~ — FIXED by FIX1
-   (CGRAM glyphs, LCD-enable gating, MU50 LEDs).
+3. ~~`lcd_text_cgram` / `lcd_text_flags` write-only~~ — flags FIXED by
+   FIX1 (LCD-enable gating, MU50 LEDs); CGRAM FIXED by FIX2 (direct
+   registered read — FIX1's function-based read did not survive
+   synthesis, warning 10036).
 
 ## How to produce the .rbf (once Quartus exists)
 
@@ -133,10 +178,15 @@ the .rbf directly. Then: check the Quartus fit report (timing + M10K
 usage), and test on hardware against both a bitmap sender (old path)
 and a text-packet sender.
 
-## Quartus status (2026-11-09, blocker)
+## Quartus status (2026-11-10, unblocked via CI)
 
-Quartus Prime Lite 17.0 is **not installed and could not be downloaded
-without an Intel/Altera account** from this VM:
+Quartus Prime Lite 17.0 is **not installed on this VM and could not
+be downloaded** from it (see below), so local builds are not possible.
+The unblocker is GitHub Actions on the public fork
+(`ckeisc/X68000_MiSTer`, workflow `.github/workflows/build-rbf.yml`,
+`raetro/quartus:17.0` image): prototype, baseline, and FIX1 RBFs
+have all built there (~41–43 min each). FIX1 closed timing
+(setup +1.769 ns video_clock); FIX2 awaits its CI run.
 
 - Download page:
   https://www.altera.com/downloads/fpga-development-tools/quartus-prime-lite-edition-design-software-version-17-0-linux

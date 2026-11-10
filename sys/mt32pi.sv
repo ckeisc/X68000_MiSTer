@@ -158,9 +158,9 @@ reg  [7:0] lcd_data[1024];
 // packet clears lcd_text_valid. Text RAM is written on CLK_AUDIO and
 // read on CLK_VIDEO, same cross-domain wart as the existing lcd_data.
 reg  [7:0] lcd_text_ddram[80];
-reg  [7:0] lcd_text_cgram[64]; // captured, not yet rendered (TODO)
+reg  [7:0] lcd_text_cgram[64]; // CGRAM custom chars, rendered by txt_glyph_row (FIX1)
 reg  [7:0] lcd_text_mode;      // 0 = SC-55 (2 rows), 1 = MU50 (4 rows)
-reg  [7:0] lcd_text_flags;     // bit0: LCD enable; bits 4:0: MU50 LEDs (TODO)
+reg  [7:0] lcd_text_flags;     // bit0: LCD enable (gates text); bits 4:0: MU50 LEDs (FIX1)
 reg         lcd_text_valid;
 
 // 5x7 font, transcribed from Nuked-SC55 lcd_font.h (rows 0..6, bit4=left).
@@ -170,6 +170,41 @@ function [4:0] lcd_text_font_row(input [7:0] ch, input [2:0] row);
 	if (ch < 8'h10) lcd_text_font_row = 5'h1f;               // CGRAM: solid block (PROTOTYPE)
 	else if (ch < 8'h20 || ch > 8'h7e) lcd_text_font_row = 5'h00;
 	else lcd_text_font_row = LCD_TEXT_FONT_ROM[3324 - ((ch - 8'h20)*7 + row)*5 -: 5];
+endfunction
+//
+// FIX1 (timing): pipelined text expansion. The prototype expanded
+// text combinationally in one CE_PIXEL cycle - /6 and %6 dividers,
+// an asynchronous DDRAM read, and the font-ROM lookup chained into
+// mt32_lcd_pix - which failed setup on video_clock (-6.933 ns).
+// The pipeline splits that chain into three registered stages,
+// each a single short operation feeding a register, and uses a
+// 0..5 pixel counter instead of division/modulo. Rendered output
+// is unchanged: 6 px/char (5 px glyph + 1 px gap), 8 px/row.
+reg  [6:0] txt_ddram_addr; // registered DDRAM read address (sync read)
+reg  [7:0] txt_char;       // registered DDRAM byte
+reg  [4:0] txt_glyph;      // registered glyph row for the current char
+reg  [4:0] txt_col;        // current char column 0..19
+reg  [2:0] txt_px;         // pixel within char 0..5
+//
+// DDRAM index for (row, col). MU50: row*20+col, with row*20 built
+// from shifts (row*16 + row*4) - no multiplier. SC-55: HD44780
+// 2-line addressing, row 0 -> col, row 1 -> 40+col.
+function [6:0] txt_ddram_idx(input [2:0] row, input [4:0] col, input [7:0] mode);
+	reg [6:0] row20;
+	begin
+		row20 = ({4'b0000, row} << 4) + ({4'b0000, row} << 2);
+		if (mode == 8'd1) txt_ddram_idx = row20 + {2'b00, col};
+		else txt_ddram_idx = (row == 3'd0) ? {2'b00, col} : (7'd40 + {2'b00, col});
+	end
+endfunction
+//
+// Glyph row for a DDRAM char. Codes < 0x10 are CGRAM custom chars
+// (8 chars x 8 rows, 5 bits/row; address {char[2:0], row} = char*8+row),
+// which is how MU50 bar-graph and SC-55 level-meter glyphs are drawn.
+// Other codes come from the font ROM (blank outside 0x20..0x7E).
+function [4:0] txt_glyph_row(input [7:0] ch, input [2:0] row);
+	if (ch < 8'h10) txt_glyph_row = lcd_text_cgram[{ch[2:0], row}][4:0];
+	else txt_glyph_row = lcd_text_font_row(ch, row);
 endfunction
 reg        lcd_sz;
 
@@ -311,10 +346,11 @@ always @(posedge CLK_VIDEO) begin
 	reg [7:0] hcnt;
 	reg [6:0] vcnt;
 	reg [7:0] sh;
-	reg [6:0] txt_idx;  // PROTOTYPE text expansion
-	reg [7:0] txt_char;
-	reg [4:0] txt_glyph;
-	reg       txt_pix;
+	// FIX1: combinational temps for the text pipeline (single-cycle
+	// operations only; the long chain lives in the registered stages).
+	reg       txt_in_window;
+	reg       txt_pix_bit;
+	reg       txt_led_pix;
 
 	if(CE_PIXEL) begin
 		old_de <= VGA_DE;
@@ -327,21 +363,76 @@ always @(posedge CLK_VIDEO) begin
 		if(old_de & ~VGA_DE & ~&vcnt) vcnt <= vcnt + 1'd1;
 		if(~old_vs & VGA_VS) vcnt <= 0;
 
-		// PROTOTYPE (option C): expand text RAM to pixels. 6 px/char, 8 px/row.
-		// MU50: DDRAM rows are 20 chars. SC-55: HD44780 2-line addressing.
-		// Out-of-window pixels read DDRAM[0] harmlessly and are forced to 0.
-		if (lcd_text_valid && (hcnt[6:0] / 6) < 20 && vcnt[5:3] < ((lcd_text_mode == 8'd1) ? 3'd4 : 3'd2)) begin
-			if (lcd_text_mode == 8'd1) txt_idx = vcnt[5:3]*20 + (hcnt[6:0] / 6);
-			else txt_idx = (vcnt[5:3] == 3'd0) ? (hcnt[6:0] / 6) : (7'd40 + (hcnt[6:0] / 6));
-			txt_char = lcd_text_ddram[txt_idx[6:0]];
-			txt_glyph = lcd_text_font_row(txt_char, vcnt[2:0]);
-			txt_pix = ((hcnt[6:0] % 6) < 6'd5) && ((txt_glyph >> (4 - (hcnt[6:0] % 6))) & 5'd1);
-		end else begin
-			txt_pix = 1'b0;
-		end
+		// Text window: first 20 chars (120 px) of the active rows.
+		// MU50: 4 rows; SC-55: 2 rows. (Pre-edge hcnt/vcnt, same
+		// values the bitmap path below uses.)
+		txt_in_window = lcd_text_valid && (hcnt[6:0] < 7'd120) &&
+			(vcnt[5:3] < ((lcd_text_mode == 8'd1) ? 3'd4 : 3'd2));
+
+		// Pixel bit for the current position, from the registered
+		// glyph and pixel counter. The shift amount wraps to 31 when
+		// txt_px==5, so the 1 px inter-char gap reads 0.
+		txt_pix_bit = lcd_text_flags[0] && txt_in_window &&
+			((txt_glyph >> (5'd4 - {2'b00, txt_px})) & 5'd1);
+
+		// MU50 LEDs: 5 squares, 5 px wide + 1 px gap, in the first
+		// unused row below the text (page 4, y 32..37), x 0..29.
+		// flags bit i = LED i. Panel indicators: shown whenever a
+		// text packet is active in MU50 mode, independent of the
+		// LCD-enable flag. Only visible in 128x64 mode (page 4 is
+		// outside the 128x32 enable window, like MU50 rows 2..3).
+		txt_led_pix = lcd_text_valid && (lcd_text_mode == 8'd1) &&
+			(vcnt[5:3] == 3'd4) && (vcnt[2:0] < 3'd6) &&
+			(((hcnt[6:0] < 7'd5)  && lcd_text_flags[0]) ||
+			 ((hcnt[6:0] >= 7'd6  && hcnt[6:0] < 7'd11) && lcd_text_flags[1]) ||
+			 ((hcnt[6:0] >= 7'd12 && hcnt[6:0] < 7'd17) && lcd_text_flags[2]) ||
+			 ((hcnt[6:0] >= 7'd18 && hcnt[6:0] < 7'd23) && lcd_text_flags[3]) ||
+			 ((hcnt[6:0] >= 7'd24 && hcnt[6:0] < 7'd29) && lcd_text_flags[4]));
 
 		mt32_lcd_en  <= mt32_available & ~hcnt[7] && (lcd_sz ? !vcnt[6] : !vcnt[6:5]);
-		mt32_lcd_pix <= lcd_text_valid ? txt_pix : lcd_data[{vcnt[5:3],hcnt[6:0]}][vcnt[2:0]];
+		mt32_lcd_pix <= lcd_text_valid ? (txt_pix_bit | txt_led_pix) : lcd_data[{vcnt[5:3],hcnt[6:0]}][vcnt[2:0]];
+
+		// Text pipeline: fetch the NEXT char 3/2/1 pixels early so
+		// each stage is one short operation feeding a register.
+		//   txt_px==3: register DDRAM address of the next char
+		//   txt_px==4: register DDRAM byte (synchronous read)
+		//   txt_px==5: register glyph row (font ROM or CGRAM)
+		// The glyph is therefore ready before the next char's first
+		// pixel, and the pixel output above only does a 5:1 mux.
+		if(sh[7]) begin
+			// New line starts (hcnt resets this edge): restart the
+			// char counters. Char 0's glyph was fetched during
+			// blanking (else-branch below), so it is already ready.
+			txt_col <= 5'd0;
+			txt_px  <= 3'd0;
+		end else if(txt_in_window) begin
+			if(txt_px == 3'd3 && txt_col < 5'd19)
+				txt_ddram_addr <= txt_ddram_idx(vcnt[5:3], txt_col + 5'd1, lcd_text_mode);
+			if(txt_px == 3'd4)
+				txt_char <= lcd_text_ddram[txt_ddram_addr];
+			if(txt_px == 3'd5)
+				txt_glyph <= txt_glyph_row(txt_char, vcnt[2:0]);
+			if(txt_px == 3'd5) begin
+				txt_px  <= 3'd0;
+				txt_col <= txt_col + 5'd1;
+			end else begin
+				txt_px <= txt_px + 3'd1;
+			end
+		end else begin
+			// Outside the text window (blanking, or past col 19):
+			// fetch char 0 of the current row, one stage per pixel.
+			// Blanking lasts many pixels, so the glyph converges
+			// well before the next line's first active pixel.
+			// Only for rows this mode displays: other rows would
+			// address DDRAM past entry 79 (MU50 row 4 = index 80).
+			if (vcnt[5:3] < ((lcd_text_mode == 8'd1) ? 3'd4 : 3'd2)) begin
+				txt_ddram_addr <= txt_ddram_idx(vcnt[5:3], 5'd0, lcd_text_mode);
+				txt_char <= lcd_text_ddram[txt_ddram_addr];
+				txt_glyph <= txt_glyph_row(txt_char, vcnt[2:0]);
+			end
+			txt_col <= 5'd0;
+			txt_px  <= 3'd0;
+		end
 	end
 end
 

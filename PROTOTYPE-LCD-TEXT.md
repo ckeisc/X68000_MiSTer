@@ -6,6 +6,46 @@ exists on this VM, so the RTL has never been compiled or simulated.
 Do not ship as-is. The old bitmap path is untouched and still the default
 until a text packet arrives.
 
+## FIX1 (2026-11-09) — pipelined text expansion, timing fix
+
+The first CI build failed setup on the 80 MHz video clock (-6.933 ns;
+baseline unmodified master is clean at +2.009 ns), so the violation was
+introduced by this prototype. The cause was the combinational text
+expansion in one CE_PIXEL cycle: `/6` and `%6` dividers, an asynchronous
+DDRAM read, and the font-ROM lookup chained into `mt32_lcd_pix`.
+
+FIX1 replaces it with a 3-stage pipeline in `sys/mt32pi.sv`, all feeding
+registers, no division/modulo/multiplier in the video path:
+
+- `txt_px==3`: register the DDRAM address of the next char (index via
+  shifts: MU50 row*20 = row*16+row*4; SC-55 HD44780 2-line addressing).
+- `txt_px==4`: register the DDRAM byte (synchronous read: registered
+  address -> register). This also fixes the Quartus warning that
+  `lcd_text_ddram` was "uninferred due to asynchronous read logic".
+- `txt_px==5`: register the glyph row (font ROM or CGRAM, from the
+  registered char). Pixel output then only does a 5:1 mux from the
+  registered glyph + a 0..5 pixel counter.
+- Char 0 of each line is fetched the same way during horizontal blanking
+  (guarded to in-range rows only: MU50 rows 4..7 would address DDRAM
+  past entry 79).
+
+CGRAM and flags are now wired in (they were write-only before):
+- Codes < 0x10 render from CGRAM (8 chars x 8 rows, 5 bits/row) instead
+  of as solid blocks — MU50 bar-graph / SC-55 level-meter glyphs.
+- `flags` bit 0 gates the text pixels (LCD enable).
+- `flags` bits 4:0 render as 5 MU50 LED squares (5 px wide + 1 px gap,
+  page 4, y 32..37, x 0..29; bit i = LED i), shown whenever a text
+  packet is active in MU50 mode, independent of the LCD-enable flag.
+  Only visible in 128x64 mode (page 4 is outside the 128x32 window).
+
+Rendered output is otherwise unchanged (6 px/char, 8 px/row, same
+addressing). Verified by a Python cycle-model of the pipeline against
+the original combinational logic (`/tmp/fix1_model.py`, kept on the VM):
+0 pixel mismatches across MU50/SC-55 x flags on/off, including a full
+horizontal-blanking sweep, and LED geometry matches spec. Timing is
+still to be confirmed by the CI rebuild (this fix + rebuild is the one
+authorised iteration).
+
 ## What it does
 
 The Pi can send the emulated LCD as *text* instead of pixels, and the FPGA
@@ -40,7 +80,9 @@ behaviour. A malformed text packet (wrong magic) is ignored.
   3325-bit ROM was verified round-trip against the source table).
   Covers ASCII 0x20..0x7E only; other codes render blank.
 - CGRAM characters (codes < 0x10, i.e. MU50's bar-graph glyphs and the
-  SC-55 level-meter glyphs) render as a solid block for now.
+  SC-55 level-meter glyphs) render from CGRAM (FIX1); before FIX1 they
+  rendered as solid blocks.
+- MU50 LEDs render as 5 squares in the row below the text (FIX1).
 
 ## Files changed
 
@@ -72,12 +114,11 @@ behaviour. A malformed text packet (wrong magic) is ignored.
 
 ## Known prototype warts (fix before shipping)
 
-1. `/ 6` and `% 6` appear three times in the render path; Quartus will
-   build multiple dividers. Replace with a 0..5 pixel counter.
-2. A spurious STOP with `textdata` still set re-toggles `mt32_lcd_update`
+1. A spurious STOP with `textdata` still set re-toggles `mt32_lcd_update`
    (extra LCD-Auto wake). Harmless, but `textdata` should be cleared on STOP.
-3. `lcd_text_cgram` / `lcd_text_flags` are write-only; Quartus will trim
-   them with warnings until CGRAM/LED rendering lands.
+2. ~~`/ 6` and `% 6` in the render path~~ — FIXED by FIX1 (pixel counter).
+3. ~~`lcd_text_cgram` / `lcd_text_flags` write-only~~ — FIXED by FIX1
+   (CGRAM glyphs, LCD-enable gating, MU50 LEDs).
 
 ## How to produce the .rbf (once Quartus exists)
 

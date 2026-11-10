@@ -4,9 +4,9 @@ Branch: `prototype/mt32pi-lcd-text-x68000` (on fork
 `ckeisc/X68000_MiSTer`, built in CI via GitHub Actions +
 `raetro/quartus:17.0`; nothing pushed to upstream MiSTer-devel).
 Status: **prototype, NOT hardware-tested.** FIX1 closed video timing
-in CI; FIX2 (CGRAM) is built the same way and awaits its CI run.
-Do not ship as-is. The old bitmap path is untouched and still the
-default until a text packet arrives.
+in CI; FIX2 (CGRAM) verified in CI (run 42880623872): CGRAM RAM
+present, timing closes. Do not ship as-is. The old bitmap path is
+untouched and still the default until a text packet arrives.
 
 ## FIX1 (2026-11-09) — pipelined text expansion, timing fix
 
@@ -83,9 +83,18 @@ CGRAM; the blanking threshold is 8 cycles (shorter blanking leaves
 char 0 wrong — not a concern at real blanking lengths). No
 `(* preserve *)` / `ramstyle` attributes, no dummy read, no direct
 `altsyncram` instantiation — the registered direct read is the fix.
-CI verification pending: mt32pi memory bits must read 9,344
-(8,832 + 512 CGRAM), a `lcd_text_cgram` sync RAM must appear in the
-netlist, warning 10036 must be gone, and setup slack must stay ≥ 0.
+CI verified (run 42880623872, 2026-11-10, SUCCESS ~41 min,
+double-confirmed): mt32pi memory bits 9,152 = `lcd_data` 8,192 +
+DDRAM 640 + CGRAM 320 — the CGRAM RAM is inferred as 64×5, not
+64×8, because only `[4:0]` is ever read, so Quartus trimmed the
+unread upper 3 bits per row (correct: HD44780 CGRAM rows are 5
+bits). Warning 10036 for `lcd_text_cgram` is gone (the only
+10036s left are in unrelated video files). Setup slack
+video_clock +1.695 ns (TNS 0), worst setup +0.194 ns, all holds
+≥ 0; no `lpm_divide` in mt32pi (the remaining ones are
+pre-existing in the MIDI UART FIFOs / RTC). RBF
+`~/workspace/mister-ci/fix2/rbf/X68000.rbf`, 4,481,508 B, sha256
+`cd2db1ec…`; comparison at `~/workspace/mister-ci/fix2/COMPARISON.md`.
 
 ## What it does
 
@@ -184,9 +193,10 @@ Quartus Prime Lite 17.0 is **not installed on this VM and could not
 be downloaded** from it (see below), so local builds are not possible.
 The unblocker is GitHub Actions on the public fork
 (`ckeisc/X68000_MiSTer`, workflow `.github/workflows/build-rbf.yml`,
-`raetro/quartus:17.0` image): prototype, baseline, and FIX1 RBFs
-have all built there (~41–43 min each). FIX1 closed timing
-(setup +1.769 ns video_clock); FIX2 awaits its CI run.
+`raetro/quartus:17.0` image): prototype, baseline, FIX1, and FIX2
+RBFs have all built there (~41–43 min each). FIX1 closed timing
+(setup +1.769 ns video_clock); FIX2 verified CGRAM in synthesis
+(run 42880623872) with timing still closed (+1.695 ns).
 
 - Download page:
   https://www.altera.com/downloads/fpga-development-tools/quartus-prime-lite-edition-design-software-version-17-0-linux
